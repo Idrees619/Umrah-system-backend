@@ -419,4 +419,241 @@ app.get('/api/health', (_,res) => res.json({success:true,message:'✅ API يعم
 app.use((_,res) => res.status(404).json({success:false,error:'المسار غير موجود'}));
 
 const PORT = process.env.PORT || 3001;
+// أضف هذا الكود في نهاية ملف api/src/index.js قبل سطر app.listen
+
+// ══════════════════════════════════════════
+// AGENTS (الوكلاء)
+// ══════════════════════════════════════════
+app.get('/api/agents', async (req, res) => {
+  try {
+    const r = await db.query('SELECT * FROM agents WHERE is_active=true ORDER BY name');
+    res.json({ success: true, data: r.rows });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/agents/:id', async (req, res) => {
+  try {
+    const r = await db.query('SELECT * FROM agents WHERE id=$1', [req.params.id]);
+    res.json({ success: true, data: r.rows[0] });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/agents', async (req, res) => {
+  try {
+    const { name, phone, company, nationality, notes } = req.body;
+    if (!name) return res.status(400).json({ success: false, error: 'الاسم مطلوب' });
+    const r = await db.query(
+      'INSERT INTO agents(name,phone,company,nationality,notes) VALUES($1,$2,$3,$4,$5) RETURNING *',
+      [name, phone, company, nationality, notes]
+    );
+    res.status(201).json({ success: true, data: r.rows[0] });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.put('/api/agents/:id', async (req, res) => {
+  try {
+    const { name, phone, company, nationality, notes } = req.body;
+    const r = await db.query(
+      'UPDATE agents SET name=$1,phone=$2,company=$3,nationality=$4,notes=$5 WHERE id=$6 RETURNING *',
+      [name, phone, company, nationality, notes, req.params.id]
+    );
+    res.json({ success: true, data: r.rows[0] });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.delete('/api/agents/:id', async (req, res) => {
+  try {
+    await db.query('UPDATE agents SET is_active=false WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ══════════════════════════════════════════
+// AUTO ASSIGN (التوزيع التلقائي)
+// ══════════════════════════════════════════
+app.get('/api/auto-assign/suggestions', async (req, res) => {
+  try {
+    const { date } = req.query;
+    if (!date) return res.status(400).json({ success: false, error: 'التاريخ مطلوب' });
+
+    // جلب الحركات غير المعيّنة في هذا اليوم
+    const unassigned = await db.query(`
+      SELECT m.*, b.group_name, b.passenger_count
+      FROM movements m
+      JOIN bookings b ON b.id = m.booking_id
+      WHERE m.movement_date = $1
+        AND m.driver_id IS NULL
+        AND m.supplier_id IS NULL
+        AND m.status != 'ملغي'
+      ORDER BY m.movement_time, m.sort_order
+    `, [date]);
+
+    if (!unassigned.rows.length) {
+      return res.json({ success: true, data: [], message: 'كل الحركات لها سائق بالفعل' });
+    }
+
+    // جلب السائقين المتاحين مع بياناتهم
+    const drivers = await db.query(`
+      SELECT d.*, v.plate_number, v.vehicle_type, v.capacity, v.id AS vid
+      FROM drivers d
+      LEFT JOIN vehicles v ON v.id = d.default_vehicle_id
+      WHERE d.is_active = true AND d.status != 'خارج الخدمة'
+      ORDER BY d.name
+    `);
+
+    // جلب رحلات كل سائق في نفس اليوم (لحساب الضغط)
+    const dayTrips = await db.query(`
+      SELECT m.driver_id, COUNT(*) as trip_count,
+             SUM(CASE WHEN (m.from_city IN ('مدينة','مكة') AND m.to_city IN ('مدينة','مكة') AND m.from_city != m.to_city)
+                      OR (m.from_city IN ('جدة') AND m.to_city IN ('مدينة'))
+                      OR (m.from_city IN ('مدينة') AND m.to_city IN ('جدة'))
+                 THEN 1 ELSE 0 END) as long_count,
+             SUM(CASE WHEN NOT ((m.from_city IN ('مدينة','مكة') AND m.to_city IN ('مدينة','مكة') AND m.from_city != m.to_city)
+                      OR (m.from_city IN ('جدة') AND m.to_city IN ('مدينة'))
+                      OR (m.from_city IN ('مدينة') AND m.to_city IN ('جدة')))
+                 THEN 1 ELSE 0 END) as short_count,
+             MAX(m.movement_time) as last_time,
+             (SELECT m2.to_city FROM movements m2 WHERE m2.driver_id = m.driver_id AND m2.movement_date=$1 ORDER BY m2.movement_time DESC LIMIT 1) as last_location
+      FROM movements m
+      WHERE m.movement_date = $1 AND m.driver_id IS NOT NULL AND m.status != 'ملغي'
+      GROUP BY m.driver_id
+    `, [date]);
+
+    const tripMap = {};
+    dayTrips.rows.forEach(t => { tripMap[t.driver_id] = t; });
+
+    // خوارزمية التوزيع
+    const suggestions = [];
+    const driverLoad  = {}; // تتبع الحمل المُضاف في هذه الجلسة
+
+    // تهيئة حمل كل سائق
+    drivers.rows.forEach(d => {
+      const existing = tripMap[d.id] || { trip_count:0, long_count:0, short_count:0, last_time:null, last_location:null };
+      driverLoad[d.id] = {
+        driver:       d,
+        long_count:   parseInt(existing.long_count  || 0),
+        short_count:  parseInt(existing.short_count || 0),
+        last_time:    existing.last_time,
+        last_location: existing.last_location || d.current_location,
+      };
+    });
+
+    for (const movement of unassigned.rows) {
+      const isLong = isLongRoute(movement.from_city, movement.to_city);
+      let bestDriver = null;
+      let bestScore  = -1;
+
+      for (const d of drivers.rows) {
+        const load = driverLoad[d.id];
+
+        // فحص الحد الأقصى
+        if (isLong && load.long_count >= 2)    continue; // تجاوز الحد
+        if (!isLong && load.short_count >= 3)   continue;
+        if (load.long_count >= 2 && load.short_count >= 1) continue;
+        if (load.long_count + load.short_count >= 3) continue;
+
+        // حساب النقاط
+        let score = 0;
+
+        // 1. الموقع مطابق
+        const driverLoc = load.last_location || d.current_location;
+        if (driverLoc === movement.from_city) score += 50;
+        else if (isNearby(driverLoc, movement.from_city)) score += 20;
+
+        // 2. وقت كافٍ بعد الرحلة السابقة
+        if (load.last_time) {
+          const gap = timeGapMinutes(load.last_time, movement.movement_time);
+          const needed = isLong ? 300 : 120; // 5 ساعات للطويل، ساعتان للقصير
+          if (gap >= needed) score += 30;
+          else if (gap >= needed / 2) score += 10;
+          else continue; // وقت غير كافٍ
+        } else {
+          score += 30; // سائق فارغ
+        }
+
+        // 3. أقل ضغطاً أفضل
+        score += (3 - load.long_count - load.short_count) * 5;
+
+        if (score > bestScore) {
+          bestScore  = score;
+          bestDriver = d;
+        }
+      }
+
+      suggestions.push({
+        movement_id:   movement.id,
+        movement_type: movement.movement_type,
+        movement_date: movement.movement_date,
+        movement_time: movement.movement_time,
+        from_city:     movement.from_city,
+        to_city:       movement.to_city,
+        group_name:    movement.group_name,
+        passenger_count: movement.passenger_count,
+        is_long:       isLong,
+        suggested_driver: bestDriver ? {
+          id:           bestDriver.id,
+          name:         bestDriver.name,
+          phone:        bestDriver.phone,
+          plate_number: bestDriver.plate_number,
+          vehicle_id:   bestDriver.vid,
+          current_location: driverLoad[bestDriver.id].last_location || bestDriver.current_location,
+        } : null,
+        score: bestScore,
+      });
+
+      // تحديث حمل السائق المختار
+      if (bestDriver) {
+        const load = driverLoad[bestDriver.id];
+        if (isLong) load.long_count++;
+        else        load.short_count++;
+        load.last_time     = movement.movement_time;
+        load.last_location = movement.to_city;
+      }
+    }
+
+    res.json({ success: true, data: suggestions, date });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// تطبيق التوزيع المقترح
+app.post('/api/auto-assign/apply', async (req, res) => {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const { assignments } = req.body; // [{movement_id, driver_id, vehicle_id}]
+    let count = 0;
+    for (const a of assignments) {
+      if (!a.driver_id) continue;
+      await client.query(
+        'UPDATE movements SET driver_id=$1, vehicle_id=$2, driver_type=$3 WHERE id=$4',
+        [a.driver_id, a.vehicle_id || null, 'internal', a.movement_id]
+      );
+      count++;
+    }
+    await client.query('COMMIT');
+    res.json({ success: true, applied: count });
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ success: false, error: e.message });
+  } finally { client.release(); }
+});
+
+// ── دوال مساعدة ──
+function isLongRoute(from, to) {
+  const longPairs = [
+    ['مكة','مدينة'],['مدينة','مكة'],
+    ['جدة','مدينة'],['مدينة','جدة'],
+  ];
+  return longPairs.some(([a,b]) => from===a && to===b);
+}
+
+function isNearby(loc1, loc2) {
+  const near = { 'جدة':['مكة'], 'مكة':['جدة'], 'مدينة':['مطار-مدينة'], 'مطار-مدينة':['مدينة'], 'مطار-جدة':['جدة'] };
+  return (near[loc1]||[]).includes(loc2);
+}
+
+function timeGapMinutes(t1, t2) {
+  const toMin = t => { const [h,m]=(t||'00:00').slice(0,5).split(':'); return parseInt(h)*60+parseInt(m); };
+  return toMin(t2) - toMin(t1);
+}
 app.listen(PORT, () => console.log(`🚌 API على المنفذ ${PORT}`));
