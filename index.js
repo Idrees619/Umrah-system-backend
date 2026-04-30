@@ -414,13 +414,6 @@ app.post('/api/suppliers/:id/payment', async (req,res) => {
   } catch(e){ res.status(500).json({success:false,error:e.message}); }
 });
 
-// Health
-app.get('/api/health', (_,res) => res.json({success:true,message:'✅ API يعمل',time:new Date()}));
-app.use((_,res) => res.status(404).json({success:false,error:'المسار غير موجود'}));
-
-const PORT = process.env.PORT || 3001;
-// أضف هذا الكود في نهاية ملف api/src/index.js قبل سطر app.listen
-
 // ══════════════════════════════════════════
 // AGENTS (الوكلاء)
 // ══════════════════════════════════════════
@@ -469,14 +462,13 @@ app.delete('/api/agents/:id', async (req, res) => {
 });
 
 // ══════════════════════════════════════════
-// AUTO ASSIGN (التوزيع التلقائي)
+// AUTO ASSIGN (التوزيع التلقائي للسائقين)
 // ══════════════════════════════════════════
 app.get('/api/auto-assign/suggestions', async (req, res) => {
   try {
     const { date } = req.query;
     if (!date) return res.status(400).json({ success: false, error: 'التاريخ مطلوب' });
 
-    // جلب الحركات غير المعيّنة في هذا اليوم
     const unassigned = await db.query(`
       SELECT m.*, b.group_name, b.passenger_count
       FROM movements m
@@ -492,7 +484,6 @@ app.get('/api/auto-assign/suggestions', async (req, res) => {
       return res.json({ success: true, data: [], message: 'كل الحركات لها سائق بالفعل' });
     }
 
-    // جلب السائقين المتاحين مع بياناتهم
     const drivers = await db.query(`
       SELECT d.*, v.plate_number, v.vehicle_type, v.capacity, v.id AS vid
       FROM drivers d
@@ -501,7 +492,6 @@ app.get('/api/auto-assign/suggestions', async (req, res) => {
       ORDER BY d.name
     `);
 
-    // جلب رحلات كل سائق في نفس اليوم (لحساب الضغط)
     const dayTrips = await db.query(`
       SELECT m.driver_id, COUNT(*) as trip_count,
              SUM(CASE WHEN (m.from_city IN ('مدينة','مكة') AND m.to_city IN ('مدينة','مكة') AND m.from_city != m.to_city)
@@ -522,11 +512,8 @@ app.get('/api/auto-assign/suggestions', async (req, res) => {
     const tripMap = {};
     dayTrips.rows.forEach(t => { tripMap[t.driver_id] = t; });
 
-    // خوارزمية التوزيع
     const suggestions = [];
-    const driverLoad  = {}; // تتبع الحمل المُضاف في هذه الجلسة
-
-    // تهيئة حمل كل سائق
+    const driverLoad = {};
     drivers.rows.forEach(d => {
       const existing = tripMap[d.id] || { trip_count:0, long_count:0, short_count:0, last_time:null, last_location:null };
       driverLoad[d.id] = {
@@ -546,32 +533,26 @@ app.get('/api/auto-assign/suggestions', async (req, res) => {
       for (const d of drivers.rows) {
         const load = driverLoad[d.id];
 
-        // فحص الحد الأقصى
-        if (isLong && load.long_count >= 2)    continue; // تجاوز الحد
+        if (isLong && load.long_count >= 2)    continue;
         if (!isLong && load.short_count >= 3)   continue;
         if (load.long_count >= 2 && load.short_count >= 1) continue;
         if (load.long_count + load.short_count >= 3) continue;
 
-        // حساب النقاط
         let score = 0;
-
-        // 1. الموقع مطابق
         const driverLoc = load.last_location || d.current_location;
         if (driverLoc === movement.from_city) score += 50;
         else if (isNearby(driverLoc, movement.from_city)) score += 20;
 
-        // 2. وقت كافٍ بعد الرحلة السابقة
         if (load.last_time) {
           const gap = timeGapMinutes(load.last_time, movement.movement_time);
-          const needed = isLong ? 300 : 120; // 5 ساعات للطويل، ساعتان للقصير
+          const needed = isLong ? 300 : 120;
           if (gap >= needed) score += 30;
           else if (gap >= needed / 2) score += 10;
-          else continue; // وقت غير كافٍ
+          else continue;
         } else {
-          score += 30; // سائق فارغ
+          score += 30;
         }
 
-        // 3. أقل ضغطاً أفضل
         score += (3 - load.long_count - load.short_count) * 5;
 
         if (score > bestScore) {
@@ -601,7 +582,6 @@ app.get('/api/auto-assign/suggestions', async (req, res) => {
         score: bestScore,
       });
 
-      // تحديث حمل السائق المختار
       if (bestDriver) {
         const load = driverLoad[bestDriver.id];
         if (isLong) load.long_count++;
@@ -615,12 +595,11 @@ app.get('/api/auto-assign/suggestions', async (req, res) => {
   } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// تطبيق التوزيع المقترح
 app.post('/api/auto-assign/apply', async (req, res) => {
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    const { assignments } = req.body; // [{movement_id, driver_id, vehicle_id}]
+    const { assignments } = req.body;
     let count = 0;
     for (const a of assignments) {
       if (!a.driver_id) continue;
@@ -638,7 +617,7 @@ app.post('/api/auto-assign/apply', async (req, res) => {
   } finally { client.release(); }
 });
 
-// ── دوال مساعدة ──
+// ── دوال مساعدة للتوزيع التلقائي ──
 function isLongRoute(from, to) {
   const longPairs = [
     ['مكة','مدينة'],['مدينة','مكة'],
@@ -656,4 +635,10 @@ function timeGapMinutes(t1, t2) {
   const toMin = t => { const [h,m]=(t||'00:00').slice(0,5).split(':'); return parseInt(h)*60+parseInt(m); };
   return toMin(t2) - toMin(t1);
 }
+
+// Health
+app.get('/api/health', (_,res) => res.json({success:true,message:'✅ API يعمل',time:new Date()}));
+app.use((_,res) => res.status(404).json({success:false,error:'المسار غير موجود'}));
+
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`🚌 API على المنفذ ${PORT}`));
